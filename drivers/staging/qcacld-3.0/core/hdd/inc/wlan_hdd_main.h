@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2019 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -339,6 +339,8 @@ static inline bool in_compat_syscall(void) { return is_compat_task(); }
 #define WLAN_NUD_STATS_ARP_PKT_TYPE 1
 /* Assigned size of driver memory dump is 4096 bytes */
 #define DRIVER_MEM_DUMP_SIZE    4096
+/* Max number of states supported by the driver for thermal mitigation */
+#define HDD_THERMAL_MAX_STATE 2
 
 /*
  * @eHDD_DRV_OP_PROBE: Refers to .probe operation
@@ -361,6 +363,7 @@ enum {
  * @eHDD_REASSOC_IN_PROGRESS: reassociation is in progress
  * @eHDD_EAPOL_IN_PROGRESS: STA/P2P-CLI is in middle of EAPOL/WPS exchange
  * @eHDD_SAP_EAPOL_IN_PROGRESS: SAP/P2P-GO is in middle of EAPOL/WPS exchange
+ * @eHDD_SAP_CONNECTION_IN_PROGRESS: SAP/P2P-GO is in middle of connection.
  */
 typedef enum {
 	eHDD_SCAN_REJECT_DEFAULT = 0,
@@ -368,6 +371,7 @@ typedef enum {
 	eHDD_REASSOC_IN_PROGRESS,
 	eHDD_EAPOL_IN_PROGRESS,
 	eHDD_SAP_EAPOL_IN_PROGRESS,
+	eHDD_SAP_CONNECTION_IN_PROGRESS,
 } scan_reject_states;
 
 #define MAX_PROBE_REQ_OUIS 16
@@ -1062,6 +1066,8 @@ enum dhcp_nego_status {
  * MSB of rx_mc_bc_cnt indicates whether FW supports rx_mc_bc_cnt
  * feature or not, if first bit is 1 it indictes that FW supports this
  * feature, if it is 0 it indicates FW doesn't support this feature
+ * @support_mode: Max supported mode of a station currently
+ * connected to sap
  */
 typedef struct {
 	bool isUsed;
@@ -1080,6 +1086,7 @@ typedef struct {
 	uint64_t rx_bytes;
 	qdf_time_t last_tx_rx_ts;
 	qdf_time_t assoc_ts;
+	qdf_time_t disassoc_ts;
 	uint32_t tx_rate;
 	uint32_t rx_rate;
 	bool ampdu;
@@ -1106,6 +1113,7 @@ typedef struct {
 	uint16_t capability;
 	uint32_t rx_mc_bc_cnt;
 	uint32_t rx_retry_cnt;
+	uint8_t support_mode;
 } hdd_station_info_t;
 
 /**
@@ -1581,7 +1589,7 @@ struct hdd_adapter_s {
 	bool offloads_configured;
 
 	/* DSCP to UP QoS Mapping */
-	sme_QosWmmUpType hddWmmDscpToUpMap[WLAN_HDD_MAX_DSCP + 1];
+	sme_QosWmmUpType hddWmmDscpToUpMap[WLAN_MAX_DSCP + 1];
 
 #ifdef WLAN_FEATURE_LINK_LAYER_STATS
 	bool isLinkLayerStatsSet;
@@ -1936,6 +1944,21 @@ struct hdd_cache_channels {
 };
 
 /**
+ * enum hdd_thermal_states - The various thermal states as supported by WLAN
+ * @HDD_THERMAL_STATE_NORMAL - The normal working state
+ * @HDD_THERMAL_STATE_MEDIUM - The intermediate state, WLAN must perform partial
+ *                             mitigation
+ * @HDD_THERMAL_STATE_HIGH - The highest state, WLAN must enter forced IMPS and
+ *                           will disconnect any active STA connection
+ */
+enum hdd_thermal_states {
+	HDD_THERMAL_STATE_NORMAL = 0,
+	HDD_THERMAL_STATE_MEDIUM = 1,
+	HDD_THERMAL_STATE_HIGH = 2,
+	HDD_THERMAL_STATE_INVAL = 0xFF,
+};
+
+/**
  * struct hdd_context_s
  * @adapter_nodes: an array of adapter nodes for keeping track of hdd adapters
  */
@@ -1976,6 +1999,7 @@ struct hdd_context_s {
 	bool is_ol_rx_thread_suspended;
 #endif
 
+	bool is_ol_mon_thread_suspended;
 	bool hdd_wlan_suspended;
 	bool suspended;
 	/* flag to start pktlog after SSR/PDR if previously enabled */
@@ -2258,6 +2282,10 @@ struct hdd_context_s {
 
 	enum sar_version sar_version;
 
+	bool is_ssr_in_progress;
+
+	uint8_t pktcapture_mode;
+	bool is_thermal_system_registered;
 };
 
 int hdd_validate_channel_and_bandwidth(hdd_adapter_t *adapter,
@@ -2292,6 +2320,84 @@ hdd_adapter_t *hdd_open_adapter(hdd_context_t *pHddCtx, uint8_t session_type,
 				const char *name, tSirMacAddr macAddr,
 				unsigned char name_assign_type,
 				bool rtnl_held);
+
+#ifdef WLAN_FEATURE_PKT_CAPTURE
+
+/**
+ * wlan_hdd_is_session_type_monitor() - check if session type is MONITOR
+ * @session_type: session type
+ *
+ * Return: True - if session type for adapter is monitor, else False
+ *
+ */
+bool wlan_hdd_is_session_type_monitor(uint8_t session_type);
+
+/**
+ * wlan_hdd_check_mon_concurrency() - check if MONITOR and STA concurrency
+ * is UP when packet capture mode is enabled.
+ * @void
+ *
+ * Return: True - if STA and monitor concurrency is there, else False
+ *
+ */
+bool wlan_hdd_check_mon_concurrency(void);
+
+/**
+ * wlan_hdd_add_monitor_check() - check for monitor intf and add if needed
+ * @hdd_ctx: pointer to hdd context
+ * @adapter: output pointer to hold created monitor adapter
+ * @type: type of the interface
+ * @name: name of the interface
+ * @rtnl_held: True if RTNL lock is held
+ * @name_assign_type: the name of assign type of the netdev
+ *
+ * Return: 0 - on success
+ *         err code - on failure
+ */
+int wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
+			       enum nl80211_iftype type, const char *name,
+			       bool rtnl_held, unsigned char name_assign_type);
+
+/**
+ * wlan_hdd_del_monitor() - delete monitor interface
+ * @hdd_ctx: pointer to hdd context
+ * @adapter: adapter to be deleted
+ * @rtnl_held: rtnl lock held
+ *
+ * This function is invoked to delete monitor interface.
+ *
+ * Return: None
+ */
+void wlan_hdd_del_monitor(hdd_context_t *hdd_ctx,
+			  hdd_adapter_t *adapter, bool rtnl_held);
+#else
+static inline
+bool wlan_hdd_is_session_type_monitor(uint8_t session_type)
+{
+	return false;
+}
+
+static inline
+bool wlan_hdd_check_mon_concurrency(void)
+{
+	return false;
+}
+
+static inline
+int wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
+			       enum nl80211_iftype type, const char *name,
+			       bool rtnl_held, unsigned char name_assign_type)
+{
+	return 0;
+}
+
+static inline
+void wlan_hdd_del_monitor(hdd_context_t *hdd_ctx,
+			  hdd_adapter_t *adapter, bool rtnl_held)
+{
+}
+#endif /* WLAN_FEATURE_PKT_CAPTURE */
+
 QDF_STATUS hdd_close_adapter(hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter,
 			     bool rtnl_held);
 QDF_STATUS hdd_close_all_adapters(hdd_context_t *pHddCtx, bool rtnl_held);
@@ -2401,6 +2507,19 @@ struct qdf_mac_addr *
 hdd_wlan_get_ibss_mac_addr_from_staid(hdd_adapter_t *pAdapter,
 				      uint8_t staIdx);
 void hdd_checkandupdate_phymode(hdd_context_t *pHddCtx);
+
+/**
+ * wlan_hdd_validate_mac_address() - Function to validate mac address
+ * @mac_addr: input mac address
+ *
+ * Return QDF_STATUS
+ */
+#define wlan_hdd_validate_mac_address(mac_addr) \
+	__wlan_hdd_validate_mac_address(mac_addr, __func__)
+
+QDF_STATUS __wlan_hdd_validate_mac_address(struct qdf_mac_addr *mac_addr,
+					   const char *func);
+
 #ifdef MSM_PLATFORM
 /**
  * hdd_bus_bw_compute_timer_start() - start the bandwidth timer
@@ -2459,20 +2578,23 @@ int hdd_bus_bandwidth_init(hdd_context_t *hdd_ctx);
  * Return: None.
  */
 void hdd_bus_bandwidth_destroy(hdd_context_t *hdd_ctx);
+
+#define GET_BW_COMPUTE_INTV(config) ((config)->busBandwidthComputeInterval)
+
 #else
-void hdd_bus_bw_compute_timer_start(hdd_context_t *hdd_ctx)
+static inline void hdd_bus_bw_compute_timer_start(hdd_context_t *hdd_ctx)
 {
 }
 
-void hdd_bus_bw_compute_timer_try_start(hdd_context_t *hdd_ctx)
+static inline void hdd_bus_bw_compute_timer_try_start(hdd_context_t *hdd_ctx)
 {
 }
 
-void hdd_bus_bw_compute_timer_stop(hdd_context_t *hdd_ctx)
+static inline void hdd_bus_bw_compute_timer_stop(hdd_context_t *hdd_ctx)
 {
 }
 
-void hdd_bus_bw_compute_timer_try_stop(hdd_context_t *hdd_ctx)
+static inline void hdd_bus_bw_compute_timer_try_stop(hdd_context_t *hdd_ctx)
 {
 }
 
@@ -2480,14 +2602,17 @@ static inline void hdd_stop_bus_bw_computer_timer(hdd_adapter_t *pAdapter)
 {
 }
 
-int hdd_bus_bandwidth_init(hdd_context_t *hdd_ctx)
+static inline int hdd_bus_bandwidth_init(hdd_context_t *hdd_ctx)
 {
 	return 0;
 }
 
-void hdd_bus_bandwidth_destroy(hdd_context_t *hdd_ctx)
+static inline void hdd_bus_bandwidth_destroy(hdd_context_t *hdd_ctx)
 {
 }
+
+#define GET_BW_COMPUTE_INTV(config) 0
+
 #endif
 
 int hdd_init(void);
@@ -2693,6 +2818,28 @@ static inline int hdd_process_pktlog_command(hdd_context_t *hdd_ctx,
 }
 #endif /* REMOVE_PKT_LOG */
 
+#if defined(FEATURE_SG) && !defined(CONFIG_HL_SUPPORT)
+/**
+ * hdd_set_sg_flags() - enable SG flag in the network device
+ * @hdd_ctx: HDD context
+ * @wlan_dev: network device structure
+ *
+ * This function enables the SG feature flag in the
+ * given network device.
+ *
+ * Return: none
+ */
+static inline void hdd_set_sg_flags(hdd_context_t *hdd_ctx,
+	 struct net_device *wlan_dev)
+{
+	hdd_debug("SG Enabled");
+	wlan_dev->features |= NETIF_F_SG;
+}
+#else
+static inline void hdd_set_sg_flags(hdd_context_t *hdd_ctx,
+	 struct net_device *wlan_dev){}
+#endif
+
 #ifdef FEATURE_TSO
 /**
  * hdd_set_tso_flags() - enable TSO flags in the network device
@@ -2713,7 +2860,7 @@ static inline void hdd_set_tso_flags(hdd_context_t *hdd_ctx,
 	     * We want to enable TSO only if IP/UDP/TCP TX checksum flag is
 	     * enabled.
 	     */
-		hdd_info("TSO Enabled");
+		hdd_debug("TSO Enabled");
 		wlan_dev->features |=
 			 NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			 NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_SG;
@@ -2721,7 +2868,10 @@ static inline void hdd_set_tso_flags(hdd_context_t *hdd_ctx,
 }
 #else
 static inline void hdd_set_tso_flags(hdd_context_t *hdd_ctx,
-	 struct net_device *wlan_dev){}
+	 struct net_device *wlan_dev)
+{
+	hdd_set_sg_flags(hdd_ctx, wlan_dev);
+}
 #endif /* FEATURE_TSO */
 
 #if defined(FEATURE_WLAN_MCC_TO_SCC_SWITCH) || \
@@ -3120,13 +3270,14 @@ int hdd_driver_memdump_init(void);
 void hdd_driver_memdump_deinit(void);
 
 /**
- * hdd_is_cli_iface_up() - check if there is any cli iface up
- * @hdd_ctx: HDD context
+ * hdd_driver_mem_cleanup() - Frees memory allocated for
+ * driver dump
  *
- * Return: return true if there is any cli iface(STA/P2P_CLI) is up
- *         else return false
+ * This function  frees driver dump memory.
+ *
+ * Return: None
  */
-bool hdd_is_cli_iface_up(hdd_context_t *hdd_ctx);
+void hdd_driver_mem_cleanup(void);
 
 /**
  * wlan_hdd_free_cache_channels() - Free the cache channels list
@@ -3177,4 +3328,14 @@ void hdd_update_hw_sw_info(hdd_context_t *hdd_ctx);
  */
 void hdd_get_nud_stats_cb(void *data, struct rsp_stats *rsp, void *context);
 
+void hdd_sched_scan_results(struct wiphy *wiphy, uint64_t reqid);
+
+/**
+ * hdd_set_nth_beacon_offload() - Send the nth beacon offload command to FW
+ * @adapter: HDD adapter
+ * @value: Value of n, for which the nth beacon will be forwarded by the FW
+ *
+ * Return: QDF_STATUS_SUCCESS on success and failure status on failure
+ */
+QDF_STATUS hdd_set_nth_beacon_offload(hdd_adapter_t *adapter, uint16_t value);
 #endif /* end #if !defined(WLAN_HDD_MAIN_H) */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2019 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -159,6 +159,18 @@ enum sir_conn_update_reason {
 	SIR_UPDATE_REASON_CHANNEL_SWITCH,
 	SIR_UPDATE_REASON_CHANNEL_SWITCH_STA,
 	SIR_UPDATE_REASON_PRE_CAC,
+};
+
+/**
+ * enum force_1x1_type - enum to specify the type of forced 1x1 ini provided.
+ * @FORCE_1X1_DISABLED: even if the AP is present in OUI, 1x1 will not be forced
+ * @FORCE_1X1_ENABLED_FOR_AS: If antenna sharing supported, then only do 1x1.
+ * @FORCE_1X1_ENABLED_FORCED: If AP present in OUI, force 1x1 connection.
+ */
+enum force_1x1_type {
+	FORCE_1X1_DISABLED,
+	FORCE_1X1_ENABLED_FOR_AS,
+	FORCE_1X1_ENABLED_FORCED,
 };
 
 typedef enum {
@@ -519,6 +531,7 @@ typedef struct sSirSmeReadyReq {
 	void *pe_roam_synch_cb;
 	void *sme_msg_cb;
 	void *stop_roaming_cb;
+	void *csr_roam_pmkid_req_cb;
 } tSirSmeReadyReq, *tpSirSmeReadyReq;
 
 /**
@@ -924,6 +937,11 @@ typedef struct sSirChannelList {
 	uint8_t channelNumber[SIR_ESE_MAX_MEAS_IE_REQS];
 } tSirChannelList, *tpSirChannelList;
 
+struct sir_channel_list {
+	uint8_t numChannels;
+	uint8_t channelNumber[];
+};
+
 typedef struct sSirDFSChannelList {
 	uint32_t timeStamp[SIR_MAX_24G_5G_CHANNEL_RANGE];
 
@@ -1057,7 +1075,7 @@ typedef struct sSirSmeScanReq {
 	uint32_t oui_field_offset;
 
 	/* channelList MUST be the last field of this structure */
-	tSirChannelList channelList;
+	struct sir_channel_list channelList;
 
 	/*-----------------------------
 	   tSirSmeScanReq....
@@ -1195,6 +1213,7 @@ typedef struct sAniGetTsmStatsRsp {
 				 * Per STA stats request must
 				 * contain valid
 				 */
+	struct qdf_mac_addr bssid; /* bssid to get the tsm stats for */
 	tAniTrafStrmMetrics tsmMetrics;
 	void *tsmStatsReq;      /* tsm stats request backup */
 } tAniGetTsmStatsRsp, *tpAniGetTsmStatsRsp;
@@ -3646,6 +3665,14 @@ struct mawc_params {
 	uint8_t mawc_roam_rssi_low_adjust;
 };
 
+/**
+ * struct roam_sync_timeout_timer_info - Info related to roam sync timer
+ * @vdev_id: Vdev id for which host waiting roam sync ind from fw
+ */
+struct roam_sync_timeout_timer_info {
+	uint8_t vdev_id;
+};
+
 typedef struct sSirRoamOffloadScanReq {
 	uint16_t message_type;
 	uint16_t length;
@@ -3721,6 +3748,12 @@ typedef struct sSirRoamOffloadScanReq {
 	uint32_t min_delay_btw_roam_scans;
 	uint32_t roam_trigger_reason_bitmask;
 	bool roam_force_rssi_trigger;
+	bool roaming_scan_policy;
+	uint32_t btm_offload_config;
+	uint32_t btm_solicited_timeout;
+	uint32_t btm_max_attempt_cnt;
+	uint32_t btm_sticky_time;
+	uint32_t btm_query_bitmask;
 } tSirRoamOffloadScanReq, *tpSirRoamOffloadScanReq;
 
 typedef struct sSirRoamOffloadScanRsp {
@@ -4324,7 +4357,7 @@ typedef struct sSirScanOffloadReq {
 	uint32_t oui_field_len;
 	uint32_t oui_field_offset;
 
-	tSirChannelList channelList;
+	struct sir_channel_list channelList;
 	/*-----------------------------
 	  sSirScanOffloadReq....
 	  -----------------------------
@@ -6159,9 +6192,9 @@ struct sir_wifi_peer_signal_stats {
 	/* Background noise */
 	int32_t nf[WIFI_MAX_CHAINS];
 
-	int32_t per_ant_rx_mpdus[WIFI_MAX_CHAINS];
-	int32_t per_ant_tx_mpdus[WIFI_MAX_CHAINS];
-	int32_t num_chain;
+	uint32_t per_ant_rx_mpdus[WIFI_MAX_CHAINS];
+	uint32_t per_ant_tx_mpdus[WIFI_MAX_CHAINS];
+	uint32_t num_chain;
 };
 
 #define WIFI_VDEV_NUM     4
@@ -6807,14 +6840,34 @@ struct sir_nss_update_request {
 };
 
 /**
- * struct sir_beacon_tx_complete_rsp
- *
- * @session_id: session for which beacon update happened
- * @tx_status: status of the beacon tx from FW
+ * enum sir_bcn_update_reason: bcn update reason
+ * @REASON_DEFAULT: reason default
+ * @REASON_NSS_UPDATE: If NSS is updated
+ * @REASON_CONFIG_UPDATE: Config update
+ * @REASON_SET_HT2040: HT2040 update
+ * @REASON_COLOR_CHANGE: Color change
+ * @REASON_CHANNEL_SWITCH: channel switch
  */
-struct sir_beacon_tx_complete_rsp {
-	uint8_t session_id;
-	uint8_t tx_status;
+enum sir_bcn_update_reason {
+	REASON_DEFAULT = 0,
+	REASON_NSS_UPDATE = 1,
+	REASON_CONFIG_UPDATE = 2,
+	REASON_SET_HT2040 = 3,
+	REASON_COLOR_CHANGE = 4,
+	REASON_CHANNEL_SWITCH = 5,
+};
+
+/**
+ * struct sir_bcn_update_rsp
+ *
+ * @vdev_id: session for which bcn was updated
+ * @reason: bcn update reason
+ * @status: status of the beacon sent to FW
+ */
+struct sir_bcn_update_rsp {
+	uint8_t vdev_id;
+	enum sir_bcn_update_reason reason;
+	QDF_STATUS status;
 };
 
 typedef void (*nss_update_cb)(void *context, uint8_t tx_status, uint8_t vdev_id,
@@ -8534,6 +8587,16 @@ struct sir_sae_msg {
 	uint16_t length;
 	uint16_t session_id;
 	uint8_t sae_status;
+};
+
+/**
+ * struct set_pcl_req - Request message to set the PCL
+ * @chan_weights: PCL channel weights
+ * @band: Supported band
+ */
+struct set_pcl_req {
+	struct wmi_pcl_chan_weights chan_weights;
+	tSirRFBand band;
 };
 
 #endif /* __SIR_API_H */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2019 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -403,10 +403,14 @@ static int wlan_hdd_probe(struct device *dev, void *bdev, const struct hif_bus_i
 	if (ret)
 		goto err_hdd_deinit;
 
-
-	if (reinit) {
-		cds_set_recovery_in_progress(false);
-	} else {
+	/*
+	 * Recovery in progress flag will be set if SSR triggered.
+	 * If SSR is triggered during Load time, this flag will be set
+	 * so reset of this flag should be done in both the cases,
+	 * during load time and during re-init
+	 */
+	cds_set_recovery_in_progress(false);
+	if (!reinit) {
 		cds_set_load_in_progress(false);
 		cds_set_driver_loaded(true);
 		hdd_start_complete(0);
@@ -429,10 +433,10 @@ err_hdd_deinit:
 	    re_init_fail_cnt >= SSR_MAX_FAIL_CNT)
 		QDF_BUG(0);
 
-	if (reinit) {
+	cds_set_recovery_in_progress(false);
+	if (reinit)
 		cds_set_driver_in_bad_state(true);
-		cds_set_recovery_in_progress(false);
-	} else
+	else
 		cds_set_load_in_progress(false);
 
 err_init_qdf_ctx:
@@ -459,14 +463,18 @@ static inline void hdd_pld_driver_unloading(struct device *dev)
  */
 static void wlan_hdd_remove(struct device *dev)
 {
+	hdd_context_t *hdd_ctx;
+
 	pr_info("%s: Removing driver v%s\n", WLAN_MODULE_NAME,
 		QWLAN_VERSIONSTR);
-
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
 	cds_set_driver_loaded(false);
 	cds_set_unload_in_progress(true);
 
 	if (!cds_wait_for_external_threads_completion(__func__))
 		hdd_warn("External threads are still active attempting driver unload anyway");
+
+	qdf_cancel_delayed_work(&hdd_ctx->iface_idle_work);
 
 	if (!hdd_wait_for_debugfs_threads_completion())
 		hdd_warn("Debugfs threads are still active attempting driver unload anyway");
@@ -1149,6 +1157,12 @@ static int wlan_hdd_pld_probe(struct device *dev,
 		return -EINVAL;
 	}
 
+	/*
+	 * If PLD_RECOVERY is received before probe then clear
+	 * CDS_DRIVER_STATE_RECOVERING.
+	 */
+	cds_set_recovery_in_progress(false);
+
 	return wlan_hdd_probe(dev, bdev, id, bus_type, false);
 }
 
@@ -1368,6 +1382,7 @@ static void hdd_cleanup_on_fw_down(void)
 		hdd_cleanup_scan_queue(hdd_ctx, NULL);
 	wlan_hdd_purge_notifier();
 	qdf_complete_wait_events();
+
 	EXIT();
 }
 
@@ -1383,7 +1398,8 @@ static void wlan_hdd_set_the_pld_uevent(struct pld_uevent_data *uevent)
 	case PLD_FW_DOWN:
 	case PLD_RECOVERY:
 		cds_set_target_ready(false);
-		cds_set_recovery_in_progress(true);
+		if (!cds_is_driver_loading())
+			cds_set_recovery_in_progress(true);
 		break;
 	default:
 		return;
@@ -1431,6 +1447,7 @@ static void wlan_hdd_pld_uevent(struct device *dev,
 		cds_set_target_ready(false);
 		hdd_pld_ipa_uc_shutdown_pipes();
 		wlan_hdd_purge_notifier();
+		qdf_complete_wait_events();
 		break;
 	case PLD_FW_DOWN:
 		hdd_cleanup_on_fw_down();
@@ -1474,6 +1491,60 @@ static int wlan_hdd_pld_runtime_resume(struct device *dev,
 }
 #endif
 
+#ifdef FW_THERMAL_THROTTLE_SUPPORT
+/**
+ * wlan_hdd_pld_set_therm_state() - Notify the thermal state
+ * @dev: device
+ * @state: the thermal state
+ *
+ * This callback is registered with PLD to send thermal state change
+ * notification to the WLAN host. When the thermal subsystem triggers a state
+ * change notification to the PLD, the PLD uses this callback to forward the
+ * notification.
+ *
+ * Return: 0 on success, error code otherwise
+ */
+static int wlan_hdd_pld_set_therm_state(struct device *dev, int state)
+{
+	hdd_context_t *hdd_ctx;
+
+	if (cds_is_driver_in_bad_state() && cds_is_driver_recovering() &&
+	    cds_is_fw_down()) {
+		hdd_err("Rejecting thermal notif during FW down/bad state");
+		return -EBUSY;
+	}
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (!hdd_ctx) {
+		hdd_err("hdd_ctx is NULL return");
+		return -EINVAL;
+	}
+
+	hdd_debug("thermal state: %d notification", state);
+	if (state != HDD_THERMAL_STATE_HIGH)
+		cds_set_driver_thermal_mitigated(false);
+
+	switch (state) {
+	case HDD_THERMAL_STATE_HIGH:
+		hdd_send_thermal_notification(hdd_ctx,
+					      HDD_THERMAL_STATE_HIGH);
+		break;
+	case HDD_THERMAL_STATE_MEDIUM:
+		hdd_send_thermal_notification(hdd_ctx,
+					      HDD_THERMAL_STATE_MEDIUM);
+		break;
+	case HDD_THERMAL_STATE_NORMAL:
+		hdd_send_thermal_notification(hdd_ctx,
+					      HDD_THERMAL_STATE_NORMAL);
+		break;
+	default:
+		hdd_debug("Invalid thermal state");
+	}
+
+	return 0;
+}
+#endif
+
 struct pld_driver_ops wlan_drv_ops = {
 	.probe      = wlan_hdd_pld_probe,
 	.remove     = wlan_hdd_pld_remove,
@@ -1490,6 +1561,9 @@ struct pld_driver_ops wlan_drv_ops = {
 #ifdef FEATURE_RUNTIME_PM
 	.runtime_suspend = wlan_hdd_pld_runtime_suspend,
 	.runtime_resume = wlan_hdd_pld_runtime_resume,
+#endif
+#ifdef FW_THERMAL_THROTTLE_SUPPORT
+	.set_curr_therm_state = wlan_hdd_pld_set_therm_state,
 #endif
 };
 
