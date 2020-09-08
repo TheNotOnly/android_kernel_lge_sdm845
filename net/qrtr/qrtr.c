@@ -557,7 +557,7 @@ static int qrtr_bcast_enqueue(struct qrtr_node *node, struct sk_buff *skb)
 	}
 	mutex_unlock(&qrtr_node_lock);
 
-	qrtr_local_enqueue(NULL, skb);
+	qrtr_local_enqueue(node, skb);
 
 	return 0;
 }

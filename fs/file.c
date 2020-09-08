@@ -89,7 +89,7 @@ static void copy_fd_bitmaps(struct fdtable *nfdt, struct fdtable *ofdt,
  */
 static void copy_fdtable(struct fdtable *nfdt, struct fdtable *ofdt)
 {
-	size_t cpy, set;
+	unsigned int cpy, set;
 
 	BUG_ON(nfdt->max_fds < ofdt->max_fds);
 
